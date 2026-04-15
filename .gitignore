@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+credentials.json
+token.json
+
+# Temporary / generated files
+.tmp/
+reports/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+dist/
+build/
