@@ -185,3 +185,10 @@ python -m tools.build_report \
 _Update this section when you discover new constraints, better query patterns, or recurring issues._
 
 - 2026-04-15: Initial workflow created.
+- 2026-04-16: Parallelized social/background searches in scrape_company.py and competitor
+  searches in find_competitors.py using ThreadPoolExecutor. Budget decisions remain
+  sequential (charge before launch); only the HTTP calls run concurrently. Added 24h TTL
+  cache for competitors.json (saves 4 calls on re-runs for the same target). Added
+  threading.Lock to CallBudget.charge() to prevent race conditions under concurrency.
+  Expected wall-clock improvement: ~60–80 s per full run (4 companies × 4 parallel
+  searches instead of sequential).

@@ -31,6 +31,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import concurrent.futures
+
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -440,42 +442,35 @@ def research_company(
         scraped_labels.add(label)
         log(f"  [{slug}] Scraped {label} ({len(md)} chars)")
 
-    # ── Step E: LinkedIn search ───────────────────────────────
-    if budget.can_afford(1, slug):
-        budget.charge("search:linkedin", slug)
-        results = _firecrawl_search(f'site:linkedin.com/company {search_qualifier}', limit=5)
-        social_results["linkedin"] = results
-    else:
-        budget.skipped.append(f"{slug}: skipped search:linkedin — budget")
+    # ── Steps E–H: Social + background searches (parallel) ───────────────────
+    # Budget decisions are made sequentially so limits are respected, then all
+    # approved HTTP calls are executed concurrently.
+    _SOCIAL_SEARCHES = [
+        ("linkedin",         lambda q: f'site:linkedin.com/company {q}',               5),
+        ("instagram_tiktok", lambda q: f'{q} instagram followers OR tiktok followers',  6),
+        ("youtube",          lambda q: f'{q} youtube channel subscribers',              5),
+        ("background",       lambda q: f'{q} founded year employees headcount funding', 8),
+    ]
 
-    # ── Step F: Instagram + TikTok search ────────────────────
-    if budget.can_afford(1, slug):
-        budget.charge("search:instagram_tiktok", slug)
-        results = _firecrawl_search(
-            f'{search_qualifier} instagram followers OR tiktok followers', limit=6
-        )
-        social_results["instagram_tiktok"] = results
-    else:
-        budget.skipped.append(f"{slug}: skipped search:instagram_tiktok — budget")
+    searches_approved: list[tuple[str, str, int]] = []
+    for key, query_fn, limit in _SOCIAL_SEARCHES:
+        if budget.can_afford(1, slug):
+            budget.charge(f"search:{key}", slug)
+            searches_approved.append((key, query_fn(search_qualifier), limit))
+        else:
+            budget.skipped.append(f"{slug}: skipped search:{key} — budget")
 
-    # ── Step G: YouTube search ────────────────────────────────
-    if budget.can_afford(1, slug):
-        budget.charge("search:youtube", slug)
-        results = _firecrawl_search(
-            f'{search_qualifier} youtube channel subscribers', limit=5
-        )
-        social_results["youtube"] = results
-    else:
-        budget.skipped.append(f"{slug}: skipped search:youtube — budget")
-
-    # ── Step H: Background search ─────────────────────────────
-    if budget.can_afford(1, slug):
-        budget.charge("search:background", slug)
-        background_results = _firecrawl_search(
-            f'{search_qualifier} founded year employees headcount funding', limit=8
-        )
-    else:
-        budget.skipped.append(f"{slug}: skipped search:background — budget")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_firecrawl_search, query, limit): key
+                for key, query, limit in searches_approved}
+        for fut in concurrent.futures.as_completed(futs):
+            key = futs[fut]
+            results = fut.result()
+            if key == "background":
+                background_results = results
+            else:
+                social_results[key] = results
+            log(f"  [{slug}] search:{key} done ({len(results)} results)")
 
     # ── Step I: LLM extraction ────────────────────────────────
     if not OPENAI_API_KEY:

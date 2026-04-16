@@ -28,6 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import concurrent.futures
+
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -39,6 +41,7 @@ TMP_DIR = ROOT_DIR / ".tmp"
 
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+COMPETITORS_CACHE_TTL_HOURS = 24
 
 # Domains to strip from competitor results (review aggregators, news, social)
 _NOISE_DOMAINS = {
@@ -224,45 +227,61 @@ def find_competitors(
     target_audience = target_profile.get("target_audience", "") or ""
     target_url = target_profile.get("url", "")
 
+    # ── Check competitors cache ───────────────────────────────
+    cache_path = TMP_DIR / "competitors.json"
+    if cache_path.exists():
+        from datetime import timedelta
+        age = datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if age < timedelta(hours=COMPETITORS_CACHE_TTL_HOURS):
+            with open(cache_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("target") == name:
+                log(f"  Using cached competitors ({age.seconds // 3600}h old)")
+                return cached.get("competitors", [])
+
     log(f"  Finding competitors for: {name}")
 
     all_results: list[dict] = []
 
-    # ── Search 1: direct competitors query (Dutch) ───────────
+    # ── Pre-charge approved searches (sequential budget decisions) ────────────
+    search_queue: list[tuple[str, str]] = []
+
     if budget.can_afford(1):
         budget.charge("search:competitors_q1")
-        results = _firecrawl_search(f'"{name}" concurrenten alternatieven Nederland', limit=10)
-        all_results.extend(results)
-        log(f"  Competitor search 1: {len(results)} results")
+        search_queue.append(("q1", f'"{name}" concurrenten alternatieven Nederland'))
     else:
         budget.skipped.append("find_competitors: skipped search 1 — budget")
 
-    # ── Search 2: best-in-category query (Dutch) ─────────────
     if budget.can_afford(1) and category:
         budget.charge("search:competitors_q2")
-        results = _firecrawl_search(f"beste {category} bureau Nederland 2026", limit=10)
-        all_results.extend(results)
-        log(f"  Competitor search 2: {len(results)} results")
+        search_queue.append(("q2", f"beste {category} bureau Nederland 2026"))
+    elif not category:
+        log("  Skipping search 2 — no category available")
     else:
-        if not category:
-            log("  Skipping search 2 — no category available")
-        else:
-            budget.skipped.append("find_competitors: skipped search 2 — budget")
+        budget.skipped.append("find_competitors: skipped search 2 — budget")
 
-    # ── Search 3: audience + category query (Dutch) ──────────
     if budget.can_afford(1) and category:
         budget.charge("search:competitors_q3")
         audience_snippet = target_audience[:60] if target_audience else ""
-        query = (
+        q3 = (
             f"{category} bureau Nederland {audience_snippet}".strip()
             if audience_snippet
             else f"top {category} bureau Nederland"
         )
-        results = _firecrawl_search(query, limit=10)
-        all_results.extend(results)
-        log(f"  Competitor search 3: {len(results)} results")
+        search_queue.append(("q3", q3))
     else:
-        budget.skipped.append("find_competitors: skipped search 3 — budget")
+        if category:
+            budget.skipped.append("find_competitors: skipped search 3 — budget")
+
+    # ── Execute approved searches in parallel ─────────────────────────────────
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(_firecrawl_search, query, 10): label
+                for label, query in search_queue}
+        for fut in concurrent.futures.as_completed(futs):
+            label = futs[fut]
+            results = fut.result()
+            all_results.extend(results)
+            log(f"  Competitor search {label}: {len(results)} results")
 
     # ── Clean and deduplicate ─────────────────────────────────
     cleaned = _clean_results(all_results, target_url)

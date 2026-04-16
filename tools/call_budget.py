@@ -14,6 +14,7 @@ Limits:
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 
 
@@ -27,6 +28,7 @@ class CallBudget:
         self.skipped: list[str] = []
         self.active_company: str | None = None
         self._log: list[str] = []
+        self._lock = threading.Lock()
 
     # ── active company ─────────────────────────────────────────────────────
 
@@ -47,7 +49,13 @@ class CallBudget:
         Returns False → limit would be exceeded; caller must skip.
 
         On False the reason is appended to self.skipped.
+        Thread-safe: uses an internal lock so concurrent calls don't race.
         """
+        with self._lock:
+            return self._charge_locked(label, company, cost)
+
+    def _charge_locked(self, label: str, company: str | None, cost: int) -> bool:
+        """Inner charge logic — must be called with self._lock held."""
         slug = company or self.active_company
 
         # Check global limit
